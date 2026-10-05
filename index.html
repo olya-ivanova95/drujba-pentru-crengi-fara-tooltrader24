@@ -723,6 +723,7 @@ tr:last-child td{border-bottom:0}
   var officeStatus=document.getElementById('office-status');
   var officeSelected=document.getElementById('office-selected');
   var selectedOffice=null,searchTimer=null,isSubmitting=false,purchaseSent=false;
+  var officeSearchSeq=0,officeNextOffset=null,officeCurrentTerm='',officeLoading=false,officeSeen={};
 
   function validPhone(v){var n=String(v||'').replace(/[\s\-\.\(\)]/g,'');return /^(\+?40|0040|0)?7\d{8}$/.test(n)||/^(\+?40|0040|0)[23]\d{8}$/.test(n);}
   function validEmail(v){return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v||'').trim());}
@@ -766,41 +767,53 @@ tr:last-child td{border-bottom:0}
   checkout.querySelectorAll('input[name="delivery_method"]').forEach(function(r){r.addEventListener('change',function(){setDelivery(this.value.indexOf('oficiu')>-1?'office':'address');});});
   setDelivery('office');
 
-  function fetchMatches(term){
-    var all=[],seen={},pages=0;
-    function page(offset){
-      pages++;
-      var url=FAN_PROXY+'?term='+encodeURIComponent(term)+'&offset='+offset;
-      return fetch(url,{headers:{'Accept':'application/json'}}).then(function(r){if(!r.ok) throw new Error('FAN proxy');return r.json();}).then(function(json){
-        if(json && json.success===false) throw new Error(json.error||'FAN proxy');
-        var rows=rowsFrom(json);
-        rows.forEach(function(o){var k=String(o.id||o.code||label(o));if(!seen[k]){seen[k]=1;all.push(o);}});
-        var next=nextOffset(json);
-        if(next!==null&&isFinite(next)&&next>offset&&rows.length&&pages<30) return page(next);
-        return all;
-      });
-    }
-    return page(0);
-  }
-  function renderOffices(rows){
-    officeResults.innerHTML='';
-    if(!rows.length){officeStatus.textContent='Nu am găsit puncte FAN pentru această căutare.';officeResults.classList.remove('show');return;}
-    officeStatus.textContent=rows.length+' puncte găsite. Selectează unul.';
+  function officeKey(o){return String(o.id||o.code||label(o));}
+  function appendOffices(rows,reset){
+    if(reset){officeResults.innerHTML='';officeSeen={};}
+    var added=0;
     rows.forEach(function(o){
+      var k=officeKey(o);if(officeSeen[k])return;officeSeen[k]=1;added++;
       var b=document.createElement('button');b.type='button';b.className='office-result';b.setAttribute('role','option');
       var strong=document.createElement('b');strong.textContent=label(o);b.appendChild(strong);
       var small=document.createElement('small');small.textContent=sub(o);if(small.textContent)b.appendChild(small);
       b.addEventListener('click',function(){selectedOffice=o;officeSearch.value=label(o);officeResults.classList.remove('show');officeSelected.textContent='Selectat: '+label(o)+(sub(o)?' · '+sub(o):'');officeSelected.classList.add('show');officeStatus.textContent='Punct FAN selectat.';});
       officeResults.appendChild(b);
     });
+    var total=officeResults.querySelectorAll('.office-result').length;
+    if(!total){officeStatus.textContent='Nu am găsit puncte FAN pentru această căutare.';officeResults.classList.remove('show');return;}
+    officeStatus.textContent=officeNextOffset!==null ? total+' puncte încărcate · derulează pentru mai multe' : total+' puncte găsite. Selectează unul.';
     officeResults.classList.add('show');
+  }
+  function fetchOfficePage(term,offset,reset,seq){
+    if(officeLoading)return Promise.resolve();
+    officeLoading=true;
+    var url=FAN_PROXY+'?term='+encodeURIComponent(term)+'&offset='+offset;
+    return fetch(url,{headers:{'Accept':'application/json'}}).then(function(r){if(!r.ok) throw new Error('FAN proxy');return r.json();}).then(function(json){
+      if(seq!==officeSearchSeq)return;
+      if(json && json.success===false) throw new Error(json.error||'FAN proxy');
+      var rows=rowsFrom(json),next=nextOffset(json);
+      officeNextOffset=(next!==null&&isFinite(next)&&next>offset&&rows.length)?next:null;
+      appendOffices(rows,reset);
+    }).finally(function(){officeLoading=false;});
+  }
+  function startOfficeSearch(term){
+    officeSearchSeq++;var seq=officeSearchSeq;
+    officeCurrentTerm=term;officeNextOffset=null;officeSeen={};officeResults.innerHTML='';
+    officeStatus.textContent='Se caută în lista FAN Courier...';
+    fetchOfficePage(term,0,true,seq).catch(function(){if(seq!==officeSearchSeq)return;officeResults.classList.remove('show');officeStatus.textContent='Lista FAN Courier nu a putut fi încărcată. Încearcă din nou sau alege livrarea la adresă.';});
   }
   officeSearch.addEventListener('input',function(){
     selectedOffice=null;officeSelected.classList.remove('show');officeSelected.textContent='';clearTimeout(searchTimer);
     var term=this.value.trim();
-    if(term.length<2){officeResults.classList.remove('show');officeResults.innerHTML='';officeStatus.textContent='Introduceți cel puțin 2 caractere';return;}
-    officeStatus.textContent='Se caută în lista FAN Courier...';
-    searchTimer=setTimeout(function(){fetchMatches(term).then(renderOffices).catch(function(){officeResults.classList.remove('show');officeStatus.textContent='Lista FAN Courier nu a putut fi încărcată. Încearcă din nou sau alege livrarea la adresă.';});},300);
+    if(term.length<2){officeSearchSeq++;officeCurrentTerm='';officeNextOffset=null;officeResults.classList.remove('show');officeResults.innerHTML='';officeStatus.textContent='Introduceți cel puțin 2 caractere';return;}
+    searchTimer=setTimeout(function(){startOfficeSearch(term);},250);
+  });
+  officeResults.addEventListener('scroll',function(){
+    if(!officeCurrentTerm||officeNextOffset===null||officeLoading)return;
+    if(this.scrollTop+this.clientHeight < this.scrollHeight-80)return;
+    var seq=officeSearchSeq,offset=officeNextOffset;
+    officeStatus.textContent='Se încarcă mai multe puncte FAN...';
+    fetchOfficePage(officeCurrentTerm,offset,false,seq).catch(function(){if(seq!==officeSearchSeq)return;officeStatus.textContent='Nu am putut încărca următoarele rezultate. Derulează din nou pentru reîncercare.';});
   });
 
   checkout.addEventListener('submit',function(e){
