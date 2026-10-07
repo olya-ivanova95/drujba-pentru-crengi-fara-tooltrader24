@@ -574,6 +574,7 @@ tr:last-child td{border-bottom:0}
         <form class="checkout-form" id="tooltrader-checkout" novalidate>
           <h3>Comandă</h3>
           <p class="sub">Completează datele de mai jos. Plata se face la primire.</p>
+          <input type="text" name="website" value="" autocomplete="off" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none">
 
           <div class="checkout-grid">
             <label class="checkout-field"><span class="checkout-label">Prenume <span class="req">*</span></span><input type="text" name="Prenume" autocomplete="given-name" required></label>
@@ -640,7 +641,7 @@ tr:last-child td{border-bottom:0}
         </form>
         <div class="checkout-success" id="checkout-success" role="status">
           <h3>Comanda ta a fost primită</h3>
-          <p>Mulțumim. Datele comenzii au fost trimise pentru procesare.</p>
+          <p id="success-order-text">Mulțumim. Comanda a fost înregistrată pentru procesare.</p>
         </div>
       </div>
     </div>
@@ -709,21 +710,24 @@ tr:last-child td{border-bottom:0}
   range.addEventListener('input', draw);
   draw();
 
-  /* ---------- ToolTrader24 checkout: centralized FAN proxy + Web3Forms ---------- */
+  /* ---------- ToolTrader24 checkout: FAN proxy + OpenCart order bridge ---------- */
   var ACCESS_KEY='8a8a2d01-02ee-4ef9-ab74-0da465848dd0';
   var PRODUCT='Drujbă pentru crengi fără fir 48V 6Ah – 2 baterii, 2 lanțuri';
+  var PRODUCT_URL='https://www.tooltrader24.com/drujba-pentru-crengi-fara-fir-fara-perii-48v-6ah-tayga-2-baterii-2-lanturi-promotie';
   var PRICE=127, DELIVERY_FEE=25, TOTAL=152;
   var FAN_PROXY='https://tooltrader24-fan-proxy.vercel.app/api/offices';
+  var ORDERS_ENDPOINT='https://tooltrader24-fan-proxy.vercel.app/api/orders';
   var checkout=document.getElementById('tooltrader-checkout');
   var checkoutError=document.getElementById('checkout-error');
   var checkoutSuccess=document.getElementById('checkout-success');
+  var successOrderText=document.getElementById('success-order-text');
   var submitBtn=checkout.querySelector('button[type="submit"]');
   var officeSearch=document.getElementById('office-search');
   var officeResults=document.getElementById('office-results');
   var officeStatus=document.getElementById('office-status');
   var officeSelected=document.getElementById('office-selected');
-  var selectedOffice=null,searchTimer=null,isSubmitting=false,purchaseSent=false;
-  var officeSearchSeq=0,officeNextOffset=null,officeCurrentTerm='',officeLoading=false,officeSeen={};
+  var selectedOffice=null,searchTimer=null,isSubmitting=false,purchaseSent=false,currentRequestId=null;
+  var officeState={term:'',next:null,loading:false,seq:0,seen:{},controller:null};
 
   function validPhone(v){var n=String(v||'').replace(/[\s\-\.\(\)]/g,'');return /^(\+?40|0040|0)?7\d{8}$/.test(n)||/^(\+?40|0040|0)[23]\d{8}$/.test(n);}
   function validEmail(v){return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v||'').trim());}
@@ -748,8 +752,9 @@ tr:last-child td{border-bottom:0}
     for(var i=0;i<vals.length;i++){if(vals[i]!==undefined&&vals[i]!==null&&vals[i]!==''&&!isNaN(Number(vals[i]))) return Number(vals[i]);}
     return null;
   }
-  function label(o){return o.display_label||o.label||[o.name||o.office_name||'Punct FAN',o.address,o.city||o.locality].filter(Boolean).join(' — ');}
-  function sub(o){return [o.address,o.city||o.locality,o.postcode||o.postal_code].filter(Boolean).join(' · ');}
+  function officeLabel(o){return o.display_label||o.label||[o.name||o.office_name||'Punct FAN',o.address,o.city||o.locality].filter(Boolean).join(' — ');}
+  function officeSub(o){return [o.address,o.city||o.locality,o.postcode||o.postal_code].filter(Boolean).join(' · ');}
+  function officeKey(o){return String(o.id||o.code||officeLabel(o));}
 
   function setDelivery(mode){
     document.querySelectorAll('.delivery-choice').forEach(function(card){card.classList.toggle('active',card.getAttribute('data-mode')===mode);});
@@ -762,59 +767,96 @@ tr:last-child td{border-bottom:0}
       officePanel.style.display='none';addressPanel.style.display='block';officeSearch.disabled=true;
       addr.forEach(function(i){i.disabled=false;i.required=true;});
       selectedOffice=null;officeSelected.classList.remove('show');officeSelected.textContent='';officeResults.classList.remove('show');officeResults.innerHTML='';
+      officeState.seq++;officeState.next=null;officeState.seen={};
+      if(officeState.controller){try{officeState.controller.abort();}catch(_){}}
     }
   }
   checkout.querySelectorAll('input[name="delivery_method"]').forEach(function(r){r.addEventListener('change',function(){setDelivery(this.value.indexOf('oficiu')>-1?'office':'address');});});
   setDelivery('office');
 
-  function officeKey(o){return String(o.id||o.code||label(o));}
-  function appendOffices(rows,reset){
-    if(reset){officeResults.innerHTML='';officeSeen={};}
+  function appendOfficeRows(rows){
     var added=0;
     rows.forEach(function(o){
-      var k=officeKey(o);if(officeSeen[k])return;officeSeen[k]=1;added++;
+      var k=officeKey(o);if(officeState.seen[k])return;officeState.seen[k]=1;added++;
       var b=document.createElement('button');b.type='button';b.className='office-result';b.setAttribute('role','option');
-      var strong=document.createElement('b');strong.textContent=label(o);b.appendChild(strong);
-      var small=document.createElement('small');small.textContent=sub(o);if(small.textContent)b.appendChild(small);
-      b.addEventListener('click',function(){selectedOffice=o;officeSearch.value=label(o);officeResults.classList.remove('show');officeSelected.textContent='Selectat: '+label(o)+(sub(o)?' · '+sub(o):'');officeSelected.classList.add('show');officeStatus.textContent='Punct FAN selectat.';});
+      var strong=document.createElement('b');strong.textContent=officeLabel(o);b.appendChild(strong);
+      var small=document.createElement('small');small.textContent=officeSub(o);if(small.textContent)b.appendChild(small);
+      b.addEventListener('click',function(){selectedOffice=o;officeSearch.value=officeLabel(o);officeResults.classList.remove('show');officeSelected.textContent='Selectat: '+officeLabel(o)+(officeSub(o)?' · '+officeSub(o):'');officeSelected.classList.add('show');officeStatus.textContent='Punct FAN selectat.';});
       officeResults.appendChild(b);
     });
-    var total=officeResults.querySelectorAll('.office-result').length;
-    if(!total){officeStatus.textContent='Nu am găsit puncte FAN pentru această căutare.';officeResults.classList.remove('show');return;}
-    officeStatus.textContent=officeNextOffset!==null ? total+' puncte încărcate · derulează pentru mai multe' : total+' puncte găsite. Selectează unul.';
-    officeResults.classList.add('show');
+    return added;
   }
-  function fetchOfficePage(term,offset,reset,seq){
-    if(officeLoading)return Promise.resolve();
-    officeLoading=true;
-    var url=FAN_PROXY+'?term='+encodeURIComponent(term)+'&offset='+offset;
-    return fetch(url,{headers:{'Accept':'application/json'}}).then(function(r){if(!r.ok) throw new Error('FAN proxy');return r.json();}).then(function(json){
-      if(seq!==officeSearchSeq)return;
-      if(json && json.success===false) throw new Error(json.error||'FAN proxy');
-      var rows=rowsFrom(json),next=nextOffset(json);
-      officeNextOffset=(next!==null&&isFinite(next)&&next>offset&&rows.length)?next:null;
-      appendOffices(rows,reset);
-    }).finally(function(){officeLoading=false;});
+  function addLoadMoreButton(seq){
+    var old=officeResults.querySelector('[data-load-more]');if(old)old.remove();
+    if(officeState.next===null||officeState.next===undefined)return;
+    var more=document.createElement('button');more.type='button';more.className='office-result';more.setAttribute('data-load-more','1');
+    var strong=document.createElement('b');strong.textContent='Încarcă mai multe puncte FAN';more.appendChild(strong);
+    more.addEventListener('click',function(){if(!officeState.loading)loadOfficePage(officeState.term,officeState.next,true,seq);});
+    officeResults.appendChild(more);
   }
-  function startOfficeSearch(term){
-    officeSearchSeq++;var seq=officeSearchSeq;
-    officeCurrentTerm=term;officeNextOffset=null;officeSeen={};officeResults.innerHTML='';
-    officeStatus.textContent='Se caută în lista FAN Courier...';
-    fetchOfficePage(term,0,true,seq).catch(function(){if(seq!==officeSearchSeq)return;officeResults.classList.remove('show');officeStatus.textContent='Lista FAN Courier nu a putut fi încărcată. Încearcă din nou sau alege livrarea la adresă.';});
+  function loadOfficePage(term,offset,append,seq){
+    if(officeState.loading)return Promise.resolve();
+    officeState.loading=true;
+    if(!append){officeResults.innerHTML='';officeState.seen={};}
+    var oldMore=officeResults.querySelector('[data-load-more]');if(oldMore)oldMore.remove();
+    officeStatus.textContent=append?'Se încarcă mai multe puncte FAN...':'Se caută în lista FAN Courier...';
+    if(officeState.controller){try{officeState.controller.abort();}catch(_){}}
+    officeState.controller=typeof AbortController!=='undefined'?new AbortController():null;
+    var options={headers:{'Accept':'application/json'}};
+    if(officeState.controller)options.signal=officeState.controller.signal;
+    var url=FAN_PROXY+'?term='+encodeURIComponent(term)+'&offset='+encodeURIComponent(offset||0);
+    return fetch(url,options).then(function(r){if(!r.ok)throw new Error('FAN proxy');return r.json();}).then(function(json){
+      if(seq!==officeState.seq)return;
+      if(json&&json.success===false)throw new Error(json.error||'FAN proxy');
+      var rows=rowsFrom(json),added=appendOfficeRows(rows);
+      officeState.next=nextOffset(json);
+      if(!append&&!added){officeStatus.textContent='Nu am găsit puncte FAN pentru această căutare.';officeResults.classList.remove('show');return;}
+      officeResults.classList.add('show');
+      var count=Object.keys(officeState.seen).length;
+      officeStatus.textContent=count+' puncte încărcate. Selectează unul.';
+      addLoadMoreButton(seq);
+    }).catch(function(err){
+      if(err&&err.name==='AbortError')return;
+      if(seq!==officeState.seq)return;
+      if(!append){officeResults.classList.remove('show');officeResults.innerHTML='';}
+      officeStatus.textContent='Lista FAN Courier nu a putut fi încărcată. Încearcă din nou sau alege livrarea la adresă.';
+    }).then(function(){if(seq===officeState.seq)officeState.loading=false;});
   }
   officeSearch.addEventListener('input',function(){
     selectedOffice=null;officeSelected.classList.remove('show');officeSelected.textContent='';clearTimeout(searchTimer);
-    var term=this.value.trim();
-    if(term.length<2){officeSearchSeq++;officeCurrentTerm='';officeNextOffset=null;officeResults.classList.remove('show');officeResults.innerHTML='';officeStatus.textContent='Introduceți cel puțin 2 caractere';return;}
-    searchTimer=setTimeout(function(){startOfficeSearch(term);},250);
+    var term=this.value.trim();officeState.seq++;var seq=officeState.seq;officeState.term=term;officeState.next=null;officeState.seen={};officeState.loading=false;
+    if(officeState.controller){try{officeState.controller.abort();}catch(_){}}
+    if(term.length<2){officeResults.classList.remove('show');officeResults.innerHTML='';officeStatus.textContent='Introduceți cel puțin 2 caractere';return;}
+    searchTimer=setTimeout(function(){loadOfficePage(term,0,false,seq);},250);
   });
-  officeResults.addEventListener('scroll',function(){
-    if(!officeCurrentTerm||officeNextOffset===null||officeLoading)return;
-    if(this.scrollTop+this.clientHeight < this.scrollHeight-80)return;
-    var seq=officeSearchSeq,offset=officeNextOffset;
-    officeStatus.textContent='Se încarcă mai multe puncte FAN...';
-    fetchOfficePage(officeCurrentTerm,offset,false,seq).catch(function(){if(seq!==officeSearchSeq)return;officeStatus.textContent='Nu am putut încărca următoarele rezultate. Derulează din nou pentru reîncercare.';});
-  });
+
+  function newRequestId(){
+    if(window.crypto&&typeof window.crypto.randomUUID==='function')return window.crypto.randomUUID();
+    return 'lp-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12)+'-'+Math.random().toString(36).slice(2,10);
+  }
+  function normalizeOffice(o){
+    if(!o)return {};
+    return {
+      id:String(o.id||''),code:String(o.code||''),name:String(o.name||o.office_name||officeLabel(o)||''),
+      address:String(o.address||''),city:String(o.city||o.locality||''),postcode:String(o.postcode||o.postal_code||''),
+      county:String(o.county||''),is_machine:Boolean(o.is_machine)
+    };
+  }
+  function sendBackup(orderRes,first,last,email,phone,method,officeMode){
+    if(!ACCESS_KEY)return;
+    var backup={
+      access_key:ACCESS_KEY,
+      subject:'Comandă OpenCart #'+orderRes.order_id+': Drujbă pentru crengi 48V 6Ah',
+      from_name:'ToolTrader24 Landing Backup',
+      'OpenCart order_id':String(orderRes.order_id),'Prenume':first,'Nume':last,'E-Mail':email,'Telefon':phone,
+      'Metoda de plata':'Plata la livrare','Metoda de livrare':method,'Comentarii':value('Comentarii')||'-',
+      'Produs':PRODUCT,'Product URL':PRODUCT_URL,'Cantitate':1,
+      'Total OpenCart':String(orderRes.total)+' '+String(orderRes.currency||'RON'),'pagina':location.href
+    };
+    if(officeMode&&selectedOffice){backup['Birou/locker']=officeLabel(selectedOffice);}
+    else{backup['Oraș']=value('Oraș');backup['Cod Poștal']=value('Cod Poștal');backup['Adresă - stradă și număr']=value('Adresă - stradă și număr');}
+    fetch('https://api.web3forms.com/submit',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(backup)}).catch(function(){});
+  }
 
   checkout.addEventListener('submit',function(e){
     e.preventDefault();if(isSubmitting)return;
@@ -823,38 +865,52 @@ tr:last-child td{border-bottom:0}
     var method=checkout.querySelector('input[name="delivery_method"]:checked').value;
     var officeMode=method.indexOf('oficiu')>-1;
     var terms=checkout.elements['terms_accepted'].checked;
-    if(first.length<2) checkoutError.textContent='Completează câmpul Prenume.';
-    else if(last.length<2) checkoutError.textContent='Completează câmpul Nume.';
-    else if(!validEmail(email)) checkoutError.textContent='Introdu o adresă E-Mail validă.';
-    else if(!validPhone(phone)) checkoutError.textContent='Introdu un număr de Telefon valid.';
-    else if(officeMode&&!selectedOffice) checkoutError.textContent='Selectează un birou sau locker FAN Courier din lista de rezultate.';
-    else if(!officeMode&&(value('Oraș').length<2||value('Cod Poștal').length<2||value('Adresă - stradă și număr').length<2)) checkoutError.textContent='Completează Oraș, Cod Poștal și Adresă - stradă și număr.';
-    else if(!terms) checkoutError.textContent='Trebuie să accepți TERMENI SI CONDITII DE UTILIZARE.';
+    if(first.length<2)checkoutError.textContent='Completează câmpul Prenume.';
+    else if(last.length<2)checkoutError.textContent='Completează câmpul Nume.';
+    else if(!validEmail(email))checkoutError.textContent='Introdu o adresă E-Mail validă.';
+    else if(!validPhone(phone))checkoutError.textContent='Introdu un număr de Telefon valid.';
+    else if(officeMode&&!selectedOffice)checkoutError.textContent='Selectează un birou sau locker FAN Courier din lista de rezultate.';
+    else if(!officeMode&&(value('Oraș').length<2||value('Cod Poștal').length<2||value('Adresă - stradă și număr').length<2))checkoutError.textContent='Completează Oraș, Cod Poștal și Adresă - stradă și număr.';
+    else if(!terms)checkoutError.textContent='Trebuie să accepți TERMENI SI CONDITII DE UTILIZARE.';
     if(checkoutError.textContent){checkoutError.style.display='block';return;}
 
-    var payload={
-      access_key:ACCESS_KEY,
-      subject:'Comandă nouă: Drujbă pentru crengi 48V 6Ah – 152 RON total',
-      from_name:'ToolTrader24 Landing',
-      'Prenume':first,'Nume':last,'E-Mail':email,'Telefon':phone,
-      'Metoda de plata':'Plata la livrare','Metoda de livrare':method,
-      'Comentarii':value('Comentarii')||'-',
-      'Produs':PRODUCT,'Cod produs':'45897','Cantitate':1,'Preț produs':PRICE+' RON','Subtotal':PRICE+' RON',
-      'Livrare':DELIVERY_FEE+' RON','Total':TOTAL+' RON','Moneda':'RON','terms_accepted':'DA','pagina':location.href
+    if(!currentRequestId)currentRequestId=newRequestId();
+    var orderPayload={
+      request_id:currentRequestId,
+      product_url:PRODUCT_URL,
+      quantity:1,
+      firstname:first,lastname:last,email:email,telephone:phone,
+      delivery_mode:officeMode?'office':'address',
+      office:officeMode?normalizeOffice(selectedOffice):{},
+      address:officeMode?{}:{address_1:value('Adresă - stradă și număr'),city:value('Oraș'),postcode:value('Cod Poștal'),county:''},
+      comment:value('Comentarii'),
+      source_url:location.href,
+      terms_accepted:true,
+      website:value('website')
     };
-    if(officeMode&&selectedOffice){
-      payload['Birou/locker']=label(selectedOffice);payload['office_id']=selectedOffice.id||'';payload['office_code']=selectedOffice.code||'';payload['office_name']=selectedOffice.name||selectedOffice.office_name||'';payload['office_address']=selectedOffice.address||'';payload['office_city']=selectedOffice.city||selectedOffice.locality||'';payload['office_postcode']=selectedOffice.postcode||selectedOffice.postal_code||'';payload['office_is_machine']=selectedOffice.is_machine===undefined?'':String(selectedOffice.is_machine);
-    }else{
-      payload['Oraș']=value('Oraș');payload['Cod Poștal']=value('Cod Poștal');payload['Adresă - stradă și număr']=value('Adresă - stradă și număr');
-    }
 
     isSubmitting=true;submitBtn.disabled=true;submitBtn.textContent='SE TRIMITE...';
-    fetch('https://api.web3forms.com/submit',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(payload)})
-      .then(function(r){return r.json();}).then(function(res){
-        if(!res.success) throw new Error('submit');
-        if(!purchaseSent&&window.fbq){fbq('track','Purchase',{value:TOTAL,currency:'RON',content_name:PRODUCT,content_ids:['45897'],content_type:'product'});purchaseSent=true;}
-        checkout.style.display='none';checkoutSuccess.style.display='block';
-      }).catch(function(){checkoutError.textContent='Comanda nu a fost trimisă. Verifică datele și încearcă din nou.';checkoutError.style.display='block';submitBtn.disabled=false;submitBtn.textContent='TRIMITE COMANDA – 152 LEI';isSubmitting=false;});
+    var responseStatus=0;
+    fetch(ORDERS_ENDPOINT,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(orderPayload)})
+      .then(function(r){responseStatus=r.status;return r.json().catch(function(){return null;});})
+      .then(function(res){
+        if(!res||res.success!==true||!res.order_id){
+          if(responseStatus>0&&responseStatus<500&&responseStatus!==429)currentRequestId=null;
+          throw new Error(res&&res.error?String(res.error):'order');
+        }
+        var orderId=String(res.order_id),total=Number(res.total),currency=String(res.currency||'').trim();
+        if(!purchaseSent&&window.fbq&&isFinite(total)&&total>=0&&currency){
+          fbq('track','Purchase',{value:total,currency:currency,content_name:PRODUCT,content_type:'product'});purchaseSent=true;
+        }
+        checkout.style.display='none';
+        successOrderText.textContent='Mulțumim. Comanda #'+orderId+' a fost înregistrată pentru procesare.';
+        checkoutSuccess.style.display='block';
+        sendBackup(res,first,last,email,phone,method,officeMode);
+        currentRequestId=null;
+      }).catch(function(){
+        checkoutError.textContent='Comanda nu a fost trimisă. Verifică datele și încearcă din nou.';
+        checkoutError.style.display='block';submitBtn.disabled=false;submitBtn.textContent='TRIMITE COMANDA – 152 LEI';isSubmitting=false;
+      });
   });
 })();
 </script>
